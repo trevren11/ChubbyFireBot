@@ -1,0 +1,320 @@
+"""Discord bot for moderation notifications and interactions."""
+
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Optional
+
+import discord
+from discord import ButtonStyle, Embed, Interaction
+from discord.ext import commands
+from discord.ui import Button, View
+
+from src.reddit_client import RedditItem, RemovalReason
+
+
+class ModerationEmbed:
+    """Builder for moderation notification embeds."""
+
+    @staticmethod
+    def create(
+        item: RedditItem,
+        bot_decision: str,
+        confidence: float,
+        reason: str,
+        dry_run: bool = False,
+    ) -> Embed:
+        """Create an embed for a moderation decision."""
+        # Title based on content type
+        if item.content_type == "post":
+            title = f"[POST] {item.title[:50]}..." if len(item.title or "") > 50 else f"[POST] {item.title}"
+        else:
+            title = "[COMMENT] Review Needed"
+
+        if dry_run:
+            title = f"[DRY RUN] {title}"
+
+        # Color based on decision
+        colors = {
+            "approve": discord.Color.green(),
+            "remove": discord.Color.red(),
+            "flag": discord.Color.yellow(),
+        }
+        color = colors.get(bot_decision, discord.Color.blue())
+
+        # Build description
+        karma_str = f"{item.author_karma:,}"
+        description_parts = [
+            f"**Author:** u/{item.author} ({karma_str} karma, {item.account_age_days}d old)",
+        ]
+
+        if item.reports:
+            report_strs = []
+            for r in item.reports[:3]:  # Limit to 3 reports
+                if r.get("type") == "user":
+                    report_strs.append(f"{r['reason']} (x{r.get('count', 1)})")
+                else:
+                    report_strs.append(f"{r['reason']} [mod]")
+            description_parts.append(f"**Reports:** {', '.join(report_strs)}")
+
+        description_parts.append("")
+
+        # Add content preview (truncated)
+        content = item.body or ""
+        if len(content) > 500:
+            content = content[:500] + "..."
+        description_parts.append(f">>> {content}" if content else "_No text content_")
+
+        description = "\n".join(description_parts)
+
+        # Truncate description if too long
+        if len(description) > 1024:
+            description = description[:1021] + "..."
+
+        embed = Embed(
+            title=title,
+            description=description,
+            color=color,
+            url=item.url,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        # Add decision field
+        confidence_pct = f"{confidence * 100:.0f}%"
+        decision_text = f"**{bot_decision.upper()}** ({confidence_pct} confidence)"
+        embed.add_field(name="Bot Decision", value=decision_text, inline=True)
+        embed.add_field(name="Reason", value=reason[:256], inline=True)
+
+        embed.set_footer(text=f"ID: {item.reddit_id}")
+
+        return embed
+
+
+class MessageTracker:
+    """Tracks Discord message IDs to Reddit item IDs."""
+
+    def __init__(self, file_path: Path):
+        """Initialize the tracker with a file path."""
+        self.file_path = Path(file_path)
+        self._mappings: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        """Load mappings from disk."""
+        if self.file_path.exists():
+            with open(self.file_path) as f:
+                self._mappings = json.load(f)
+
+    def _save(self) -> None:
+        """Save mappings to disk."""
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.file_path, "w") as f:
+            json.dump(self._mappings, f)
+
+    def save(self, discord_id: str, reddit_id: str) -> None:
+        """Save a Discord message ID to Reddit item ID mapping."""
+        self._mappings[discord_id] = {
+            "reddit_id": reddit_id,
+            "created": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save()
+
+    def get_reddit_id(self, discord_id: str) -> Optional[str]:
+        """Get the Reddit ID for a Discord message ID."""
+        mapping = self._mappings.get(discord_id)
+        return mapping["reddit_id"] if mapping else None
+
+    def delete(self, discord_id: str) -> None:
+        """Delete a mapping."""
+        if discord_id in self._mappings:
+            del self._mappings[discord_id]
+            self._save()
+
+
+class ActionButton:
+    """Factory for action buttons."""
+
+    @staticmethod
+    def approve() -> Button:
+        """Create an approve button."""
+        return Button(
+            label="Approve",
+            style=ButtonStyle.success,
+            custom_id="approve",
+        )
+
+    @staticmethod
+    def remove(reason: RemovalReason) -> Button:
+        """Create a remove button for a specific reason."""
+        # Truncate label if needed
+        label = f"Remove: {reason.title}"
+        if len(label) > 80:
+            label = label[:77] + "..."
+
+        return Button(
+            label=label,
+            style=ButtonStyle.danger,
+            custom_id=f"remove:{reason.id}",
+        )
+
+
+class ModerationView(View):
+    """View containing moderation action buttons."""
+
+    def __init__(
+        self,
+        removal_reasons: list[RemovalReason],
+        on_approve: Callable[[Interaction], None],
+        on_remove: Callable[[Interaction, str], None],
+        timeout: float = 86400,  # 24 hours
+    ):
+        """Initialize the view with buttons."""
+        super().__init__(timeout=timeout)
+        self.on_approve_callback = on_approve
+        self.on_remove_callback = on_remove
+
+        # Add approve button
+        approve_btn = ActionButton.approve()
+        approve_btn.callback = self._handle_approve
+        self.add_item(approve_btn)
+
+        # Add remove buttons for each reason (up to 4 to fit Discord limits)
+        for reason in removal_reasons[:4]:
+            remove_btn = ActionButton.remove(reason)
+            remove_btn.callback = self._make_remove_handler(reason.id)
+            self.add_item(remove_btn)
+
+    async def _handle_approve(self, interaction: Interaction) -> None:
+        """Handle approve button click."""
+        await self.on_approve_callback(interaction)
+
+    def _make_remove_handler(self, reason_id: str):
+        """Create a remove handler for a specific reason."""
+
+        async def handler(interaction: Interaction) -> None:
+            await self.on_remove_callback(interaction, reason_id)
+
+        return handler
+
+
+class DiscordBot:
+    """Discord bot for moderation notifications."""
+
+    def __init__(
+        self,
+        token: str,
+        channel_id: int,
+        data_dir: Path,
+    ):
+        """Initialize the Discord bot."""
+        self.token = token
+        self.channel_id = channel_id
+        self.data_dir = Path(data_dir)
+
+        intents = discord.Intents.default()
+        intents.message_content = True
+
+        self._bot = commands.Bot(command_prefix="!", intents=intents)
+        self.tracker = MessageTracker(self.data_dir / "discord_messages.json")
+
+        # Callbacks for actions (set by the main app)
+        self._approve_handler: Optional[Callable] = None
+        self._remove_handler: Optional[Callable] = None
+
+    def set_action_handlers(
+        self,
+        on_approve: Callable[[str], None],
+        on_remove: Callable[[str, str], None],
+    ) -> None:
+        """Set handlers for approve and remove actions."""
+        self._approve_handler = on_approve
+        self._remove_handler = on_remove
+
+    async def handle_approve(self, interaction: Interaction) -> None:
+        """Handle an approve action from Discord."""
+        message_id = str(interaction.message.id)
+        reddit_id = self.tracker.get_reddit_id(message_id)
+
+        if reddit_id and self._approve_handler:
+            self._approve_handler(reddit_id)
+            await interaction.response.send_message(
+                f"Approved {reddit_id}",
+                ephemeral=True,
+            )
+            # Update the embed to show it was handled
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.green()
+            embed.title = f"[APPROVED] {embed.title}"
+            await interaction.message.edit(embed=embed, view=None)
+        else:
+            await interaction.response.send_message(
+                "Could not find Reddit item for this message",
+                ephemeral=True,
+            )
+
+    async def handle_remove(self, interaction: Interaction, reason_id: str) -> None:
+        """Handle a remove action from Discord."""
+        message_id = str(interaction.message.id)
+        reddit_id = self.tracker.get_reddit_id(message_id)
+
+        if reddit_id and self._remove_handler:
+            self._remove_handler(reddit_id, reason_id)
+            await interaction.response.send_message(
+                f"Removed {reddit_id} with reason {reason_id}",
+                ephemeral=True,
+            )
+            # Update the embed to show it was handled
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.red()
+            embed.title = f"[REMOVED] {embed.title}"
+            await interaction.message.edit(embed=embed, view=None)
+        else:
+            await interaction.response.send_message(
+                "Could not find Reddit item for this message",
+                ephemeral=True,
+            )
+
+    async def send_moderation_message(
+        self,
+        item: RedditItem,
+        bot_decision: str,
+        confidence: float,
+        reason: str,
+        removal_reasons: list[RemovalReason],
+        dry_run: bool = False,
+    ) -> str:
+        """Send a moderation message to Discord and return the message ID."""
+        channel = self._bot.get_channel(self.channel_id)
+        if not channel:
+            raise ValueError(f"Channel {self.channel_id} not found")
+
+        embed = ModerationEmbed.create(
+            item=item,
+            bot_decision=bot_decision,
+            confidence=confidence,
+            reason=reason,
+            dry_run=dry_run,
+        )
+
+        # Create view with action buttons
+        view = ModerationView(
+            removal_reasons=removal_reasons,
+            on_approve=self.handle_approve,
+            on_remove=self.handle_remove,
+        )
+
+        message = await channel.send(embed=embed, view=view)
+
+        # Track the mapping
+        self.tracker.save(str(message.id), item.reddit_id)
+
+        return str(message.id)
+
+    async def start(self) -> None:
+        """Start the Discord bot."""
+        await self._bot.start(self.token)
+
+    async def close(self) -> None:
+        """Close the Discord bot."""
+        await self._bot.close()
