@@ -1,12 +1,26 @@
-"""Claude session spawner for moderation decisions."""
+"""Claude session spawner for moderation decisions via Taskling API."""
 
+import base64
+import json
+import os
 import re
-import subprocess
+import time
+import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+from urllib.error import URLError
 
 from src.reddit_client import RedditItem, RemovalReason
 from src.decision_logger import Decision
+
+
+# Taskling API endpoint
+TASKLING_API_URL = "http://localhost:2525/api/chat/send"
+# Working directory for Claude sessions
+WORKING_DIR = "/Users/trenshaw/code/tasks/chubbyfire/ChubbyFireBot-chubbyfire-automated-moderating"
+# Chat state directory
+CHAT_STATE_DIR = Path.home() / ".taskling" / "chat-state"
 
 
 @dataclass
@@ -184,12 +198,79 @@ REMOVAL_REASON_ID: [ID from available reasons, only if removing]
     return instructions + context.to_prompt()
 
 
-class ClaudeSession:
-    """Spawns Claude sessions for moderation decisions."""
+def get_chat_state_path(mr_path: str, agent_index: int = 0) -> Path:
+    """Get the chat state file path for a given MR path and agent index."""
+    key = f"{mr_path}:{agent_index}"
+    encoded = base64.urlsafe_b64encode(key.encode()).decode().rstrip("=")
+    return CHAT_STATE_DIR / f"{encoded}.json"
 
-    def __init__(self, timeout: int = 60):
+
+def extract_text_from_blocks(blocks: list) -> str:
+    """Extract text content from assistant message blocks."""
+    texts = []
+    for block in blocks:
+        if block.get("type") == "text":
+            texts.append(block.get("content", ""))
+    return "\n".join(texts)
+
+
+class ClaudeSession:
+    """Spawns Claude sessions via Taskling API for moderation decisions."""
+
+    def __init__(
+        self,
+        timeout: int = 120,
+        api_url: str = TASKLING_API_URL,
+        poll_interval: float = 2.0,
+    ):
         """Initialize the session spawner."""
         self.timeout = timeout
+        self.api_url = api_url
+        self.poll_interval = poll_interval
+
+    def _get_chat_state(self, mr_path: str, agent_index: int = 0) -> Optional[dict]:
+        """Read the current chat state from disk."""
+        state_path = get_chat_state_path(mr_path, agent_index)
+        if not state_path.exists():
+            return None
+        try:
+            with open(state_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _wait_for_response(
+        self, mr_path: str, initial_message_count: int, agent_index: int = 0
+    ) -> Optional[str]:
+        """Poll chat state until we get a complete response with DECISION field or timeout."""
+        start_time = time.time()
+        poll_count = 0
+        last_text_len = 0
+
+        while time.time() - start_time < self.timeout:
+            poll_count += 1
+            state = self._get_chat_state(mr_path, agent_index)
+            if state and state.get("messages"):
+                messages = state["messages"]
+                current_count = len(messages)
+                # Check if we have new messages and the last assistant message has content
+                if current_count > initial_message_count:
+                    last_msg = messages[-1]
+                    role = last_msg.get("role")
+                    blocks = last_msg.get("blocks", [])
+                    if role == "assistant" and blocks:
+                        # Check if there's actual text content (not just tool calls)
+                        text = extract_text_from_blocks(blocks)
+                        if text.strip():
+                            # Wait until we see the DECISION field (Claude is still streaming)
+                            if "DECISION:" in text.upper():
+                                return text
+                            # If text is still growing, keep polling
+                            if len(text) != last_text_len:
+                                last_text_len = len(text)
+            time.sleep(self.poll_interval)
+
+        return None
 
     def get_decision(
         self,
@@ -198,7 +279,7 @@ class ClaudeSession:
         removal_reasons: list[RemovalReason],
         recent_decisions: list[Decision],
     ) -> ModerationDecision:
-        """Get a moderation decision from Claude."""
+        """Get a moderation decision from Claude via Taskling API."""
         prompt = build_prompt(
             item=item,
             subreddit_rules=subreddit_rules,
@@ -207,34 +288,65 @@ class ClaudeSession:
         )
 
         try:
-            result = subprocess.run(
-                ["claude", "-p", prompt],
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
+            # Use a unique agent index for each request to avoid state conflicts
+            # (Each post gets its own fresh session)
+            import random
+            request_agent_index = random.randint(100, 999)
+
+            # Get initial message count to know when response arrives
+            initial_state = self._get_chat_state(WORKING_DIR, request_agent_index)
+            initial_count = len(initial_state.get("messages", [])) if initial_state else 0
+
+            # Build request payload for Taskling API with unique agent index
+            payload = json.dumps({
+                "mrPath": WORKING_DIR,
+                "message": prompt,
+                "agentIndex": request_agent_index,
+            }).encode("utf-8")
+
+            request = urllib.request.Request(
+                self.api_url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
 
-            if result.returncode != 0:
-                # Claude CLI failed, flag for review
+            with urllib.request.urlopen(request, timeout=30) as response:
+                result = json.loads(response.read().decode("utf-8"))
+
+            # Check for API errors
+            if not result.get("success"):
                 return ModerationDecision(
                     action="flag",
                     confidence=0.3,
-                    reason=f"Claude CLI error: {result.stderr or 'unknown error'}",
+                    reason=f"Taskling API error: {result.get('error', 'unknown error')}",
                 )
 
-            return ModerationDecision.parse(result.stdout)
+            # Poll for the response using the unique agent index
+            claude_response = self._wait_for_response(
+                WORKING_DIR, initial_count, request_agent_index
+            )
 
-        except subprocess.TimeoutExpired:
+            if not claude_response:
+                return ModerationDecision(
+                    action="flag",
+                    confidence=0.3,
+                    reason="Claude session timed out waiting for response",
+                )
+
+            return ModerationDecision.parse(claude_response)
+
+        except URLError as e:
+            return ModerationDecision(
+                action="flag",
+                confidence=0.3,
+                reason=f"Connection error to Taskling API: {str(e)}",
+            )
+        except TimeoutError:
             return ModerationDecision(
                 action="flag",
                 confidence=0.3,
                 reason="Claude session timed out",
-            )
-        except FileNotFoundError:
-            return ModerationDecision(
-                action="flag",
-                confidence=0.3,
-                reason="Claude CLI not found",
             )
         except Exception as e:
             return ModerationDecision(

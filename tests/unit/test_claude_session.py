@@ -203,21 +203,33 @@ class TestModerationDecision:
 
 
 class TestClaudeSession:
-    """Tests for the Claude session spawner."""
+    """Tests for the Claude session spawner using Taskling API."""
 
-    @patch("src.claude_session.subprocess.run")
-    def test_spawn_session(self, mock_run):
-        """Test spawning a Claude session."""
-        mock_run.return_value = MagicMock(
-            stdout="""
+    @patch("src.claude_session.ClaudeSession._wait_for_response")
+    @patch("src.claude_session.ClaudeSession._get_chat_state")
+    @patch("src.claude_session.urllib.request.urlopen")
+    def test_spawn_session(self, mock_urlopen, mock_get_state, mock_wait):
+        """Test spawning a Claude session via Taskling API."""
+        # Mock API response
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "success": True,
+        }).encode()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        # Mock initial state
+        mock_get_state.return_value = {"messages": []}
+
+        # Mock response polling
+        mock_wait.return_value = """
             This is a valid FIRE post.
 
             DECISION: approve
             CONFIDENCE: 0.92
             REASON: Legitimate milestone celebration post.
-            """,
-            returncode=0,
-        )
+            """
 
         item = RedditItem(
             reddit_id="t3_test",
@@ -242,15 +254,23 @@ class TestClaudeSession:
 
         assert decision.action == "approve"
         assert decision.confidence == 0.92
-        mock_run.assert_called_once()
+        mock_urlopen.assert_called_once()
 
-    @patch("src.claude_session.subprocess.run")
-    def test_session_uses_claude_cli(self, mock_run):
-        """Test that the session invokes the claude CLI."""
-        mock_run.return_value = MagicMock(
-            stdout="DECISION: approve\nCONFIDENCE: 0.9\nREASON: ok",
-            returncode=0,
-        )
+    @patch("src.claude_session.ClaudeSession._wait_for_response")
+    @patch("src.claude_session.ClaudeSession._get_chat_state")
+    @patch("src.claude_session.urllib.request.urlopen")
+    def test_session_uses_taskling_api(self, mock_urlopen, mock_get_state, mock_wait):
+        """Test that the session calls the Taskling API endpoint."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "success": True,
+        }).encode()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        mock_get_state.return_value = {"messages": []}
+        mock_wait.return_value = "DECISION: approve\nCONFIDENCE: 0.9\nREASON: ok"
 
         item = RedditItem(
             reddit_id="t3_test",
@@ -273,18 +293,26 @@ class TestClaudeSession:
             recent_decisions=[],
         )
 
-        # Check that claude CLI was called
-        call_args = mock_run.call_args
-        assert "claude" in call_args.args[0][0]
+        # Check that Taskling API was called
+        call_args = mock_urlopen.call_args
+        request = call_args.args[0]
+        assert "localhost:2525" in request.full_url
+        assert "/api/chat/send" in request.full_url
 
-    @patch("src.claude_session.subprocess.run")
-    def test_session_handles_error(self, mock_run):
-        """Test handling Claude CLI errors."""
-        mock_run.return_value = MagicMock(
-            stdout="",
-            stderr="Error: rate limited",
-            returncode=1,
-        )
+    @patch("src.claude_session.ClaudeSession._get_chat_state")
+    @patch("src.claude_session.urllib.request.urlopen")
+    def test_session_handles_api_error(self, mock_urlopen, mock_get_state):
+        """Test handling Taskling API errors."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "success": False,
+            "error": "Session failed",
+        }).encode()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        mock_get_state.return_value = {"messages": []}
 
         item = RedditItem(
             reddit_id="t3_test",
@@ -310,3 +338,74 @@ class TestClaudeSession:
         # Should default to flag on error
         assert decision.action == "flag"
         assert decision.confidence < 0.5
+
+    @patch("src.claude_session.ClaudeSession._get_chat_state")
+    @patch("src.claude_session.urllib.request.urlopen")
+    def test_session_handles_connection_error(self, mock_urlopen, mock_get_state):
+        """Test handling connection errors to Taskling API."""
+        from urllib.error import URLError
+        mock_urlopen.side_effect = URLError("Connection refused")
+        mock_get_state.return_value = {"messages": []}
+
+        item = RedditItem(
+            reddit_id="t3_test",
+            content_type="post",
+            title="Test",
+            body="Content",
+            author="user",
+            author_karma=100,
+            account_age_days=30,
+            url="https://reddit.com/test",
+            reports=[],
+            created_utc=1700000000,
+        )
+
+        session = ClaudeSession()
+        decision = session.get_decision(
+            item=item,
+            subreddit_rules=[],
+            removal_reasons=[],
+            recent_decisions=[],
+        )
+
+        # Should default to flag on connection error
+        assert decision.action == "flag"
+        assert "connection" in decision.reason.lower() or "error" in decision.reason.lower()
+
+    @patch("src.claude_session.ClaudeSession._wait_for_response")
+    @patch("src.claude_session.ClaudeSession._get_chat_state")
+    @patch("src.claude_session.urllib.request.urlopen")
+    def test_session_handles_timeout(self, mock_urlopen, mock_get_state, mock_wait):
+        """Test handling timeout waiting for Claude response."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({"success": True}).encode()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        mock_get_state.return_value = {"messages": []}
+        mock_wait.return_value = None  # Timeout
+
+        item = RedditItem(
+            reddit_id="t3_test",
+            content_type="post",
+            title="Test",
+            body="Content",
+            author="user",
+            author_karma=100,
+            account_age_days=30,
+            url="https://reddit.com/test",
+            reports=[],
+            created_utc=1700000000,
+        )
+
+        session = ClaudeSession()
+        decision = session.get_decision(
+            item=item,
+            subreddit_rules=[],
+            removal_reasons=[],
+            recent_decisions=[],
+        )
+
+        assert decision.action == "flag"
+        assert "timed out" in decision.reason.lower()

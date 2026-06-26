@@ -122,14 +122,25 @@ class NewPostsMonitor:
         # Send Discord notification for all non-auto-approved items
         # (Skip notification for auto-approved to reduce noise)
         if not (decision.action == "approve" and should_auto_action):
-            await self.discord.send_moderation_message(
-                item=item,
-                bot_decision=decision.action,
-                confidence=decision.confidence,
-                reason=decision.reason,
-                removal_reasons=removal_reasons,
-                dry_run=self.dry_run,
-            )
+            try:
+                await self.discord.send_moderation_message(
+                    item=item,
+                    bot_decision=decision.action,
+                    confidence=decision.confidence,
+                    reason=decision.reason,
+                    removal_reasons=removal_reasons,
+                    dry_run=self.dry_run,
+                )
+            except Exception as e:
+                # Fall back to bot REST API
+                from src.discord_bot import send_bot_message
+                send_bot_message(
+                    item=item,
+                    bot_decision=decision.action,
+                    confidence=decision.confidence,
+                    reason=decision.reason,
+                    dry_run=self.dry_run,
+                )
 
         # Log the decision
         self.logger.log(Decision(

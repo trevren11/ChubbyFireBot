@@ -1,6 +1,8 @@
 """Discord bot for moderation notifications and interactions."""
 
 import json
+import os
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +14,59 @@ from discord.ext import commands
 from discord.ui import Button, View
 
 from src.reddit_client import RedditItem, RemovalReason
+
+
+def send_bot_message(
+    item: RedditItem,
+    bot_decision: str,
+    confidence: float,
+    reason: str,
+    dry_run: bool = False,
+) -> bool:
+    """Send notification via Discord bot REST API (for cron jobs)."""
+    bot_token = os.getenv("DISCORD_BOT_TOKEN")
+    channel_id = os.getenv("DISCORD_CHANNEL_ID")
+
+    if not bot_token or not channel_id:
+        print("Missing DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID")
+        return False
+
+    # Build embed
+    prefix = "[DRY RUN] " if dry_run else ""
+    title = item.title[:50] + "..." if item.title and len(item.title) > 50 else (item.title or "Comment")
+
+    colors = {"approve": 0x00FF00, "remove": 0xFF0000, "flag": 0xFFFF00}
+    color = colors.get(bot_decision, 0x0000FF)
+
+    embed = {
+        "title": f"{prefix}[{item.content_type.upper()}] {title}",
+        "description": f"**Author:** u/{item.author} ({item.author_karma:,} karma, {item.account_age_days}d old)\n\n>>> {item.body[:500] if item.body else '_No content_'}",
+        "color": color,
+        "url": item.url,
+        "fields": [
+            {"name": "Decision", "value": f"**{bot_decision.upper()}** ({confidence:.0%})", "inline": True},
+            {"name": "Reason", "value": reason[:256], "inline": True},
+        ],
+        "footer": {"text": f"ID: {item.reddit_id}"},
+    }
+
+    payload = json.dumps({"embeds": [embed]}).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bot {bot_token}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except Exception as e:
+        print(f"Discord bot API error: {e}")
+        return False
 
 
 class ModerationEmbed:

@@ -114,15 +114,26 @@ class ModQueueMonitor:
             results.flagged += 1
             decided_by = "bot"  # Still bot decision, just flagged
 
-        # Always send Discord notification
-        await self.discord.send_moderation_message(
-            item=item,
-            bot_decision=decision.action,
-            confidence=decision.confidence,
-            reason=decision.reason,
-            removal_reasons=removal_reasons,
-            dry_run=self.dry_run,
-        )
+        # Send Discord notification (try bot client first, fall back to REST API)
+        try:
+            await self.discord.send_moderation_message(
+                item=item,
+                bot_decision=decision.action,
+                confidence=decision.confidence,
+                reason=decision.reason,
+                removal_reasons=removal_reasons,
+                dry_run=self.dry_run,
+            )
+        except Exception as e:
+            # Fall back to bot REST API
+            from src.discord_bot import send_bot_message
+            send_bot_message(
+                item=item,
+                bot_decision=decision.action,
+                confidence=decision.confidence,
+                reason=decision.reason,
+                dry_run=self.dry_run,
+            )
 
         # Log the decision
         self.logger.log(Decision(
