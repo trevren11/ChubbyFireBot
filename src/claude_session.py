@@ -18,7 +18,7 @@ from src.decision_logger import Decision
 # Taskling API endpoint
 TASKLING_API_URL = "http://localhost:2525/api/chat/send"
 # Working directory for Claude sessions
-WORKING_DIR = "/Users/trenshaw/code/tasks/chubbyfire/ChubbyFireBot-chubbyfire-automated-moderating"
+WORKING_DIR = "/Users/trenshaw/code/chubbyfirebot"
 # Chat state directory
 CHAT_STATE_DIR = Path.home() / ".taskling" / "chat-state"
 
@@ -146,6 +146,7 @@ def build_prompt(
     subreddit_rules: list[dict],
     removal_reasons: list[RemovalReason],
     recent_decisions: list[Decision],
+    prior_decision: Optional[Decision] = None,
 ) -> str:
     """Build the full prompt for Claude including instructions."""
     context = ModerationContext(
@@ -155,32 +156,73 @@ def build_prompt(
         recent_decisions=recent_decisions,
     )
 
-    instructions = """You are a moderator for r/chubbyfire, a subreddit for people pursuing "chubbyFIRE"
-(Financial Independence, Retire Early with a target of $2.5M-$5M in assets).
+    instructions = """You are a moderator for r/chubbyfire, a specialized subreddit for people pursuing
+"chubbyFIRE" — Financial Independence, Retire Early with $2.5M–$5M+ in investable assets.
 
-Your task is to review the content below and make a moderation decision.
+This is NOT a general FIRE sub. The bar for approval is high and specific.
+Most removed posts are redirected to r/fire, r/personalfinance, or the weekly discussion thread.
+
+## Who This Sub Is For
+Posts should come from people who:
+- Have $2M+ in investable assets (ideally $2.5M+ to be firmly in ChubbyFIRE range)
+- Are dealing with MID-TO-ADVANCED ChubbyFIRE planning topics
+- Have specific questions that can't be answered in a general FIRE sub
 
 ## Decision Guidelines
 
-1. **APPROVE** if:
-   - Content is relevant to FIRE, financial independence, retirement planning
-   - Tone is civil and constructive
-   - No spam, self-promotion, or rule violations
-   - Confidence should be 0.85+ for auto-approve
+### APPROVE (confidence 0.85+) if ALL of the following are true:
+- Author is plausibly in ChubbyFIRE range ($2M+ investable assets) OR the post is expert-level
+- Post is mid-to-advanced: Roth conversion, SWR/withdrawal sequencing, pre-Medicare healthcare,
+  estate/trust planning, sequence-of-returns risk, concentrated stock, ACA optimization, etc.
+- Post includes real financial detail (not "I have some savings, can I retire?")
+- High-effort and thoughtful — not a drive-by question
+- Civil tone, no spam or self-promotion
+- Mod-posted weekly discussion threads (always approve)
 
-2. **REMOVE** if:
-   - Clear spam or self-promotion
-   - Off-topic content unrelated to FIRE
-   - Harassment, insults, or incivility
-   - Clear rule violations
-   - Confidence should be 0.85+ for auto-remove
-   - Select an appropriate removal_reason_id
+### REMOVE with "Mid to advanced level topics only" (ID: 3fd6e0ca-963b-49d0-9bc5-f850c8e752db) if:
+- Basic or beginner questions ("What metrics should I track?", "How do I start saving?")
+- Author is clearly early-stage or far from ChubbyFIRE (under $500K in assets)
+- Aspirational posts: "Can I ChubbyFIRE one day?" from someone not close to it
+- Generic personal finance questions better suited to r/personalfinance or r/investing
+- Vague posts with no financial detail or no real question
 
-3. **FLAG** for human review if:
-   - Borderline cases
-   - You're uncertain
-   - Content is controversial but might be valid
-   - Confidence below 0.7
+### REMOVE with "Post in weekly thread" (ID: 97031571-cec9-4a74-8e9d-4699e939de33) if:
+- Simple sanity checks without complex planning questions ("Can I retire?", "Am I on track?")
+- Lifestyle/experience posts that don't ask a specific planning question
+- Discussion-starter posts that work better in thread format than as standalone posts
+
+### REMOVE with "Be relevant to ChubbyFIRE" (ID: bf4cc7b0-a445-4593-8e35-fa1483e99441) if:
+- Author is clearly not in ChubbyFIRE territory (e.g., $700K NW, just starting out)
+- Inherited money below ~$2M and asking generic "what do I do?" questions
+- Generic r/fire questions (CoastFIRE basics, standard FI questions with no ChubbyFIRE specifics)
+- FatFIRE-targeted content (r/fatFIRE is better for >$5M+ lifestyle focus)
+- Link posts to external articles/videos without substantial new ChubbyFIRE discussion
+- "What career should I pursue to reach ChubbyFIRE?" — not about being there yet
+- Definitional questions: "What NW counts as chubby for a single person in HCOL?"
+
+### REMOVE with "No spam" (ID: d9aed1b4-450a-4c9c-88df-d8c1f8335e0b) if:
+- Financial advisor or professional promoting services (even subtly framed as advice)
+- Apps, tools, or spreadsheets being promoted by their creator
+- Posts that appear AI-generated with no personal financial detail
+- Same user posting repeatedly on similar topics
+
+### FLAG for human review if:
+- Author has ~$1.5M–$2.5M (genuinely borderline ChubbyFIRE range)
+- Post is good quality but you're unsure about the author's NW or eligibility
+- Could go either way with a reasonable judgment call
+- Any uncertainty — don't auto-remove if you're not sure
+
+## Key Signals
+
+- NW clearly below $1.5M → REMOVE (not ChubbyFIRE range)
+- NW $1.5M–$2.5M → FLAG (borderline)
+- NW $2.5M+ with real planning question → APPROVE
+- No NW disclosed, vague question → FLAG or REMOVE
+- "Can I ChubbyFIRE one day?" (far from it) → REMOVE
+- Advisor/tool self-promotion → REMOVE
+- External link post → REMOVE
+- Lifestyle post with no planning question → REMOVE (weekly thread)
+- Weekly mod thread → APPROVE
 
 ## Response Format
 
@@ -195,7 +237,19 @@ REMOVAL_REASON_ID: [ID from available reasons, only if removing]
 
 """
 
-    return instructions + context.to_prompt()
+    prompt = instructions + context.to_prompt()
+
+    if prior_decision:
+        prompt += f"""
+
+## ⚠️ RE-REPORT ALERT
+This item was previously reviewed by the bot and **{prior_decision.action.upper()}**ed (confidence: {prior_decision.confidence:.0%}).
+Prior reason: {prior_decision.reason}
+
+A user has now reported it again. Re-evaluate carefully — consider whether the prior decision was correct or whether this new report reveals something missed.
+"""
+
+    return prompt
 
 
 def get_chat_state_path(mr_path: str, agent_index: int = 0) -> Path:
@@ -219,7 +273,7 @@ class ClaudeSession:
 
     def __init__(
         self,
-        timeout: int = 120,
+        timeout: int = 300,
         api_url: str = TASKLING_API_URL,
         poll_interval: float = 2.0,
     ):
@@ -278,6 +332,7 @@ class ClaudeSession:
         subreddit_rules: list[dict],
         removal_reasons: list[RemovalReason],
         recent_decisions: list[Decision],
+        prior_decision: Optional[Decision] = None,
     ) -> ModerationDecision:
         """Get a moderation decision from Claude via Taskling API."""
         prompt = build_prompt(
@@ -285,6 +340,7 @@ class ClaudeSession:
             subreddit_rules=subreddit_rules,
             removal_reasons=removal_reasons,
             recent_decisions=recent_decisions,
+            prior_decision=prior_decision,
         )
 
         try:
