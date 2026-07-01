@@ -10,6 +10,7 @@ from src.claude_session import (
     ModerationContext,
     ModerationDecision,
     build_prompt,
+    extract_json_block,
 )
 from src.reddit_client import RedditItem, RemovalReason
 from src.decision_logger import Decision
@@ -101,6 +102,7 @@ class TestBuildPrompt:
         assert "approve" in prompt.lower()
         assert "remove" in prompt.lower()
         assert "confidence" in prompt.lower()
+        assert "json" in prompt.lower()
 
     def test_build_prompt_for_reported_content(self):
         """Test prompt for content with reports."""
@@ -128,6 +130,57 @@ class TestBuildPrompt:
         assert "3" in prompt  # Report count
 
 
+class TestExtractJsonBlock:
+    """Tests for extracting the JSON decision block from Claude's free-text output."""
+
+    def test_extract_fenced_json_block(self):
+        """Test extracting a well-formed fenced JSON block."""
+        output = """
+        Based on my analysis, this is a legitimate FIRE milestone post.
+
+        ```json
+        {
+          "action": "approve",
+          "confidence": 0.95,
+          "reason": "Genuine milestone post",
+          "removal_reason_id": null
+        }
+        ```
+        """
+
+        data = extract_json_block(output)
+
+        assert data is not None
+        assert data["action"] == "approve"
+        assert data["confidence"] == 0.95
+
+    def test_extract_bare_json_object_fallback(self):
+        """Test fallback extraction when Claude forgets the code fence."""
+        output = '{"action": "remove", "confidence": 0.8, "reason": "spam"}'
+
+        data = extract_json_block(output)
+
+        assert data is not None
+        assert data["action"] == "remove"
+
+    def test_extract_returns_none_for_incomplete_json(self):
+        """Test that a still-streaming/incomplete block returns None (not a parse error)."""
+        output = """
+        Thinking about this...
+
+        ```json
+        {
+          "action": "approve",
+          "confidence":
+        """
+
+        assert extract_json_block(output) is None
+
+    def test_extract_returns_none_for_no_json(self):
+        """Test that plain text with no JSON returns None."""
+        assert extract_json_block("I don't know what to do with this.") is None
+
+
 class TestModerationDecision:
     """Tests for parsing moderation decisions."""
 
@@ -136,9 +189,14 @@ class TestModerationDecision:
         output = """
         Based on my analysis, this is a legitimate FIRE milestone post.
 
-        DECISION: approve
-        CONFIDENCE: 0.95
-        REASON: This is a genuine post about reaching a FIRE milestone, which is on-topic for r/chubbyfire.
+        ```json
+        {
+          "action": "approve",
+          "confidence": 0.95,
+          "reason": "This is a genuine post about reaching a FIRE milestone, which is on-topic for r/chubbyfire.",
+          "removal_reason_id": null
+        }
+        ```
         """
 
         decision = ModerationDecision.parse(output)
@@ -152,10 +210,14 @@ class TestModerationDecision:
         output = """
         This appears to be spam promoting a course.
 
-        DECISION: remove
-        CONFIDENCE: 0.98
-        REASON: Self-promotional spam content that violates community guidelines.
-        REMOVAL_REASON_ID: spam_reason_123
+        ```json
+        {
+          "action": "remove",
+          "confidence": 0.98,
+          "reason": "Self-promotional spam content that violates community guidelines.",
+          "removal_reason_id": "spam_reason_123"
+        }
+        ```
         """
 
         decision = ModerationDecision.parse(output)
@@ -169,9 +231,14 @@ class TestModerationDecision:
         output = """
         I'm not certain about this post. It could be legitimate but has some concerning elements.
 
-        DECISION: flag
-        CONFIDENCE: 0.65
-        REASON: Mixed signals - could be genuine but tone is somewhat promotional. Human review recommended.
+        ```json
+        {
+          "action": "flag",
+          "confidence": 0.65,
+          "reason": "Mixed signals - could be genuine but tone is somewhat promotional. Human review recommended.",
+          "removal_reason_id": null
+        }
+        ```
         """
 
         decision = ModerationDecision.parse(output)
@@ -191,15 +258,36 @@ class TestModerationDecision:
     def test_parse_handles_missing_fields(self):
         """Test handling output with missing optional fields."""
         output = """
-        DECISION: approve
-        CONFIDENCE: 0.9
-        REASON: Looks good.
+        ```json
+        {
+          "action": "approve",
+          "confidence": 0.9,
+          "reason": "Looks good."
+        }
+        ```
         """
 
         decision = ModerationDecision.parse(output)
 
         assert decision.action == "approve"
         assert decision.removal_reason_id is None
+
+    def test_parse_clamps_invalid_action_and_confidence(self):
+        """Test that an invalid action falls back to flag and confidence is clamped."""
+        output = """
+        ```json
+        {
+          "action": "delete_everything",
+          "confidence": 5,
+          "reason": "n/a"
+        }
+        ```
+        """
+
+        decision = ModerationDecision.parse(output)
+
+        assert decision.action == "flag"
+        assert decision.confidence == 1.0
 
 
 class TestClaudeSession:
@@ -226,9 +314,14 @@ class TestClaudeSession:
         mock_wait.return_value = """
             This is a valid FIRE post.
 
-            DECISION: approve
-            CONFIDENCE: 0.92
-            REASON: Legitimate milestone celebration post.
+            ```json
+            {
+              "action": "approve",
+              "confidence": 0.92,
+              "reason": "Legitimate milestone celebration post.",
+              "removal_reason_id": null
+            }
+            ```
             """
 
         item = RedditItem(
@@ -270,7 +363,7 @@ class TestClaudeSession:
         mock_urlopen.return_value = mock_response
 
         mock_get_state.return_value = {"messages": []}
-        mock_wait.return_value = "DECISION: approve\nCONFIDENCE: 0.9\nREASON: ok"
+        mock_wait.return_value = '```json\n{"action": "approve", "confidence": 0.9, "reason": "ok"}\n```'
 
         item = RedditItem(
             reddit_id="t3_test",
@@ -298,6 +391,46 @@ class TestClaudeSession:
         request = call_args.args[0]
         assert "localhost:2525" in request.full_url
         assert "/api/chat/send" in request.full_url
+
+    @patch("src.claude_session.ClaudeSession._wait_for_response")
+    @patch("src.claude_session.ClaudeSession._get_chat_state")
+    @patch("src.claude_session.urllib.request.urlopen")
+    def test_session_requests_sonnet_5_model(self, mock_urlopen, mock_get_state, mock_wait):
+        """Test that the session requests the claude-sonnet-5 model by default."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({"success": True}).encode()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        mock_get_state.return_value = {"messages": []}
+        mock_wait.return_value = '```json\n{"action": "approve", "confidence": 0.9, "reason": "ok"}\n```'
+
+        item = RedditItem(
+            reddit_id="t3_test",
+            content_type="post",
+            title="Test",
+            body="Content",
+            author="user",
+            author_karma=100,
+            account_age_days=30,
+            url="https://reddit.com/test",
+            reports=[],
+            created_utc=1700000000,
+        )
+
+        session = ClaudeSession()
+        session.get_decision(
+            item=item,
+            subreddit_rules=[],
+            removal_reasons=[],
+            recent_decisions=[],
+        )
+
+        call_args = mock_urlopen.call_args
+        request = call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        assert payload["model"] == "claude-sonnet-5"
 
     @patch("src.claude_session.ClaudeSession._get_chat_state")
     @patch("src.claude_session.urllib.request.urlopen")

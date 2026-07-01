@@ -21,6 +21,30 @@ TASKLING_API_URL = "http://localhost:2525/api/chat/send"
 WORKING_DIR = "/Users/trenshaw/code/chubbyfirebot"
 # Chat state directory
 CHAT_STATE_DIR = Path.home() / ".taskling" / "chat-state"
+# Model used for moderation decisions (added to Taskling's model picker)
+DEFAULT_MODEL = "claude-sonnet-5"
+
+
+def extract_json_block(text: str) -> Optional[dict]:
+    """Extract the trailing JSON decision object from Claude's response.
+
+    Looks for a fenced ```json ... ``` block first (the format we ask Claude
+    to respond with), falling back to any standalone {...} object that looks
+    like a moderation decision. Returns None if no valid JSON could be found,
+    which also doubles as an "is the response still streaming" signal.
+    """
+    match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if not match:
+        match = re.search(r"(\{[^{}]*\"action\"[^{}]*\})", text, re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+    return data if isinstance(data, dict) else None
 
 
 @dataclass
@@ -33,49 +57,36 @@ class ModerationDecision:
     removal_reason_id: Optional[str] = None
 
     @classmethod
-    def parse(cls, output: str) -> "ModerationDecision":
-        """Parse a moderation decision from Claude output."""
-        # Default values for error cases
-        action = "flag"
-        confidence = 0.3
-        reason = "Could not parse Claude output"
-        removal_reason_id = None
+    def from_dict(cls, data: dict) -> "ModerationDecision":
+        """Create a ModerationDecision from a parsed JSON dict, validating/clamping fields."""
+        action = data.get("action", "flag")
+        if action not in ("approve", "remove", "flag"):
+            action = "flag"
 
-        # Try to extract DECISION
-        decision_match = re.search(r"DECISION:\s*(\w+)", output, re.IGNORECASE)
-        if decision_match:
-            action = decision_match.group(1).lower()
-            if action not in ("approve", "remove", "flag"):
-                action = "flag"
-
-        # Try to extract CONFIDENCE
-        confidence_match = re.search(r"CONFIDENCE:\s*([\d.]+)", output, re.IGNORECASE)
-        if confidence_match:
-            try:
-                confidence = float(confidence_match.group(1))
-                # Normalize if given as percentage
-                if confidence > 1:
-                    confidence = confidence / 100
-                confidence = max(0, min(1, confidence))
-            except ValueError:
-                pass
-
-        # Try to extract REASON
-        reason_match = re.search(r"REASON:\s*(.+?)(?=\n[A-Z_]+:|$)", output, re.IGNORECASE | re.DOTALL)
-        if reason_match:
-            reason = reason_match.group(1).strip()
-
-        # Try to extract REMOVAL_REASON_ID
-        reason_id_match = re.search(r"REMOVAL_REASON_ID:\s*(\S+)", output, re.IGNORECASE)
-        if reason_id_match:
-            removal_reason_id = reason_id_match.group(1).strip()
+        confidence = data.get("confidence", 0.5)
+        if isinstance(confidence, (int, float)):
+            confidence = max(0, min(1, float(confidence)))
+        else:
+            confidence = 0.5
 
         return cls(
             action=action,
             confidence=confidence,
-            reason=reason,
-            removal_reason_id=removal_reason_id,
+            reason=data.get("reason", "No reason provided"),
+            removal_reason_id=data.get("removal_reason_id") or None,
         )
+
+    @classmethod
+    def parse(cls, output: str) -> "ModerationDecision":
+        """Parse a moderation decision from Claude's free-text output."""
+        data = extract_json_block(output)
+        if data is None:
+            return cls(
+                action="flag",
+                confidence=0.3,
+                reason="Could not parse Claude output",
+            )
+        return cls.from_dict(data)
 
 
 @dataclass
@@ -226,12 +237,25 @@ Posts should come from people who:
 
 ## Response Format
 
-You MUST end your response with these fields (exactly as shown):
+You MUST end your response with a single fenced JSON code block, and nothing after it,
+in exactly this format:
 
-DECISION: [approve|remove|flag]
-CONFIDENCE: [0.0-1.0]
-REASON: [Brief explanation]
-REMOVAL_REASON_ID: [ID from available reasons, only if removing]
+```json
+{
+  "action": "approve",
+  "confidence": 0.9,
+  "reason": "Brief explanation",
+  "removal_reason_id": null
+}
+```
+
+- `action` must be exactly one of: "approve", "remove", "flag"
+- `confidence` must be a number between 0.0 and 1.0
+- `reason` must be a short plain-text explanation (no newlines)
+- `removal_reason_id` must be the ID of one of the available removal reasons if
+  action is "remove", otherwise null
+
+Do not put any text after the closing ``` of the JSON block.
 
 ---
 
@@ -276,11 +300,13 @@ class ClaudeSession:
         timeout: int = 300,
         api_url: str = TASKLING_API_URL,
         poll_interval: float = 2.0,
+        model: str = DEFAULT_MODEL,
     ):
         """Initialize the session spawner."""
         self.timeout = timeout
         self.api_url = api_url
         self.poll_interval = poll_interval
+        self.model = model
 
     def _get_chat_state(self, mr_path: str, agent_index: int = 0) -> Optional[dict]:
         """Read the current chat state from disk."""
@@ -296,13 +322,10 @@ class ClaudeSession:
     def _wait_for_response(
         self, mr_path: str, initial_message_count: int, agent_index: int = 0
     ) -> Optional[str]:
-        """Poll chat state until we get a complete response with DECISION field or timeout."""
+        """Poll chat state until we get a complete response with a parseable JSON decision, or timeout."""
         start_time = time.time()
-        poll_count = 0
-        last_text_len = 0
 
         while time.time() - start_time < self.timeout:
-            poll_count += 1
             state = self._get_chat_state(mr_path, agent_index)
             if state and state.get("messages"):
                 messages = state["messages"]
@@ -313,15 +336,11 @@ class ClaudeSession:
                     role = last_msg.get("role")
                     blocks = last_msg.get("blocks", [])
                     if role == "assistant" and blocks:
-                        # Check if there's actual text content (not just tool calls)
                         text = extract_text_from_blocks(blocks)
-                        if text.strip():
-                            # Wait until we see the DECISION field (Claude is still streaming)
-                            if "DECISION:" in text.upper():
-                                return text
-                            # If text is still growing, keep polling
-                            if len(text) != last_text_len:
-                                last_text_len = len(text)
+                        # The JSON decision block only parses successfully once
+                        # Claude has finished streaming it (closing brace + fence present)
+                        if text.strip() and extract_json_block(text) is not None:
+                            return text
             time.sleep(self.poll_interval)
 
         return None
@@ -358,6 +377,7 @@ class ClaudeSession:
                 "mrPath": WORKING_DIR,
                 "message": prompt,
                 "agentIndex": request_agent_index,
+                "model": self.model,
             }).encode("utf-8")
 
             request = urllib.request.Request(
@@ -397,12 +417,6 @@ class ClaudeSession:
                 action="flag",
                 confidence=0.3,
                 reason=f"Connection error to Taskling API: {str(e)}",
-            )
-        except TimeoutError:
-            return ModerationDecision(
-                action="flag",
-                confidence=0.3,
-                reason="Claude session timed out",
             )
         except Exception as e:
             return ModerationDecision(

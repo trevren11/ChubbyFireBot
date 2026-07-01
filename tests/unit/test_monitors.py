@@ -278,6 +278,145 @@ class TestModQueueMonitor:
         assert logged.action == "approve"
 
 
+    @pytest.mark.asyncio
+    async def test_reprocesses_previously_approved_item(
+        self, mock_reddit_client, mock_discord_bot, mock_claude_session, temp_data_dir
+    ):
+        """Mod queue always re-evaluates even if item was previously approved."""
+        item = RedditItem(
+            reddit_id="t3_recheck",
+            content_type="post",
+            title="Good post, now reported",
+            body="Solid ChubbyFIRE content",
+            author="gooduser",
+            author_karma=5000,
+            account_age_days=500,
+            url="https://reddit.com/test",
+            reports=[{"reason": "spam", "count": 1, "type": "user"}],
+            created_utc=1700000000,
+        )
+        mock_reddit_client.get_mod_queue.return_value = [item]
+
+        # Pre-log a prior approval for this item
+        logger = DecisionLogger(temp_data_dir / "decisions.jsonl")
+        logger.log(Decision(
+            reddit_id="t3_recheck",
+            content_type="post",
+            author="gooduser",
+            action="approve",
+            reason="Good ChubbyFIRE content",
+            confidence=0.96,
+            decided_by="bot",
+        ))
+
+        monitor = ModQueueMonitor(
+            reddit_client=mock_reddit_client,
+            discord_bot=mock_discord_bot,
+            claude_session=mock_claude_session,
+            decision_logger=logger,
+            dry_run=False,
+        )
+
+        results = await monitor.run()
+
+        # Must re-evaluate — not skip
+        assert results["processed"] == 1
+        mock_claude_session.get_decision.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_prior_decision_passed_to_claude(
+        self, mock_reddit_client, mock_discord_bot, mock_claude_session, temp_data_dir
+    ):
+        """Prior decision for the item is included in Claude's context."""
+        item = RedditItem(
+            reddit_id="t3_priorctx",
+            content_type="post",
+            title="Previously approved, now reported",
+            body="Good content",
+            author="user",
+            author_karma=1000,
+            account_age_days=200,
+            url="https://reddit.com/test",
+            reports=[{"reason": "spam", "count": 2, "type": "user"}],
+            created_utc=1700000000,
+        )
+        mock_reddit_client.get_mod_queue.return_value = [item]
+
+        logger = DecisionLogger(temp_data_dir / "decisions.jsonl")
+        logger.log(Decision(
+            reddit_id="t3_priorctx",
+            content_type="post",
+            author="user",
+            action="approve",
+            reason="On-topic ChubbyFIRE post",
+            confidence=0.97,
+            decided_by="bot",
+        ))
+
+        monitor = ModQueueMonitor(
+            reddit_client=mock_reddit_client,
+            discord_bot=mock_discord_bot,
+            claude_session=mock_claude_session,
+            decision_logger=logger,
+            dry_run=False,
+        )
+
+        await monitor.run()
+
+        call_kwargs = mock_claude_session.get_decision.call_args.kwargs
+        assert "prior_decision" in call_kwargs
+        assert call_kwargs["prior_decision"].action == "approve"
+
+    @pytest.mark.asyncio
+    async def test_discord_notification_shows_prior_decision(
+        self, mock_reddit_client, mock_discord_bot, mock_claude_session, temp_data_dir
+    ):
+        """Discord notification includes prior decision when item was previously actioned."""
+        item = RedditItem(
+            reddit_id="t3_notifyprior",
+            content_type="post",
+            title="Previously approved post",
+            body="Content",
+            author="user",
+            author_karma=1000,
+            account_age_days=200,
+            url="https://reddit.com/test",
+            reports=[{"reason": "spam", "count": 1, "type": "user"}],
+            created_utc=1700000000,
+        )
+        mock_reddit_client.get_mod_queue.return_value = [item]
+        mock_claude_session.get_decision.return_value = ModerationDecision(
+            action="flag",
+            confidence=0.6,
+            reason="Needs review due to report",
+        )
+
+        logger = DecisionLogger(temp_data_dir / "decisions.jsonl")
+        logger.log(Decision(
+            reddit_id="t3_notifyprior",
+            content_type="post",
+            author="user",
+            action="approve",
+            reason="Good content",
+            confidence=0.95,
+            decided_by="bot",
+        ))
+
+        monitor = ModQueueMonitor(
+            reddit_client=mock_reddit_client,
+            discord_bot=mock_discord_bot,
+            claude_session=mock_claude_session,
+            decision_logger=logger,
+            dry_run=False,
+        )
+
+        await monitor.run()
+
+        call_kwargs = mock_discord_bot.send_moderation_message.call_args.kwargs
+        assert call_kwargs.get("prior_decision") is not None
+        assert call_kwargs["prior_decision"].action == "approve"
+
+
 class TestNewPostsMonitor:
     """Tests for the new posts monitor."""
 

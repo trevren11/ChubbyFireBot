@@ -111,19 +111,30 @@ Add `--dry-run` to any command to test without taking actions.
 
 ## Discord Bot Setup
 
-1. Bot is installed as **ChubbyFireDBot**
-2. Channel ID: `1519740049607102728`
-3. When a post needs review, the bot sends an embed with:
-   - Post/comment content preview
-   - Author info (karma, account age)
-   - Reports if any
-   - Bot's decision and confidence
-   - Action buttons
+- Bot: **ChubbyMod** (Application ID: `1519741720206512168`)
+- Channel: `1519740049607102728`
+- Bot invite link (all required permissions):
+  `https://discord.com/oauth2/authorize?client_id=1519741720206512168&permissions=84992&scope=bot`
+  - Send Messages + Embed Links + Read Message History
+
+### Discord Notification Format
+
+When a post needs review, ChubbyMod sends an embed with:
+- **Full post/comment text** (up to Discord's 4096 char limit)
+- **Author info** — username, karma, account age
+- **Bot decision** — APPROVE / REMOVE / FLAG with confidence %
+- **Reason** — Claude's explanation
+- **Mod History** — how many posts/comments this author has had reviewed before, and outcomes (e.g. `2 posts seen — 1 approved, 1 removed`). Hidden for first-time authors.
+- **Action buttons** — Approve or Remove
 
 ### Discord Actions
 - Click **Approve** to approve on Reddit
 - Click **Remove: [Reason]** to remove with that reason
-- Actions update the embed to show it was handled
+- The embed updates to show it was handled (color changes, title prefixed)
+
+### Important: Environment Variable Conflict
+
+If running alongside Taskling, the shell environment may have a `DISCORD_BOT_TOKEN` set for the Taskling bot. The cron jobs use `load_dotenv(override=True)` in `src/main.py` to ensure the ChubbyMod token from `.env` is always used instead of the shell environment value.
 
 ## Reddit Integration
 
@@ -190,6 +201,12 @@ Make sure `claude` is in your PATH and you're logged in.
 
 ### "Bot is NOT a moderator"
 Add `u/ChubbyFireBot` as a mod in r/chubbyfire settings.
+
+### Discord 403 Forbidden
+The bot needs three permissions: **Send Messages**, **Embed Links**, and **Read Message History**. Use the invite link in the Discord Bot Setup section above to re-invite with all three. After re-inviting, verify the bot appears in Server Settings → Integrations.
+
+### Discord sends as "taskling" instead of "ChubbyMod"
+The shell environment has a `DISCORD_BOT_TOKEN` set by Taskling that overrides `.env`. This is fixed by `load_dotenv(override=True)` in `src/main.py`. If you see this again, verify that line hasn't been reverted.
 
 ### Async PRAW warning
 This is harmless for cron jobs. The bot works correctly.

@@ -130,6 +130,8 @@ class NewPostsMonitor:
                     reason=decision.reason,
                     removal_reasons=removal_reasons,
                     dry_run=self.dry_run,
+                    decision_logger=self.logger,
+                    auto_actioned=should_auto_action,
                 )
             except Exception as e:
                 # Fall back to bot REST API
@@ -140,6 +142,8 @@ class NewPostsMonitor:
                     confidence=decision.confidence,
                     reason=decision.reason,
                     dry_run=self.dry_run,
+                    decision_logger=self.logger,
+                    auto_actioned=should_auto_action,
                 )
 
         # Log the decision

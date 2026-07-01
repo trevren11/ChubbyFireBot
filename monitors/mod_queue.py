@@ -88,12 +88,16 @@ class ModQueueMonitor:
         """Process a single item from the mod queue."""
         results.processed += 1
 
-        # Get Claude's decision
+        # Look up any prior decision for this specific item
+        prior_decision = self.logger.get_by_id(item.reddit_id)
+
+        # Get Claude's decision, including prior context if re-reported
         decision = self.claude.get_decision(
             item=item,
             subreddit_rules=subreddit_rules,
             removal_reasons=removal_reasons,
             recent_decisions=recent_decisions,
+            prior_decision=prior_decision,
         )
 
         # Determine action based on confidence
@@ -123,6 +127,9 @@ class ModQueueMonitor:
                 reason=decision.reason,
                 removal_reasons=removal_reasons,
                 dry_run=self.dry_run,
+                decision_logger=self.logger,
+                auto_actioned=should_auto_action,
+                prior_decision=prior_decision,
             )
         except Exception as e:
             # Fall back to bot REST API
@@ -133,6 +140,9 @@ class ModQueueMonitor:
                 confidence=decision.confidence,
                 reason=decision.reason,
                 dry_run=self.dry_run,
+                decision_logger=self.logger,
+                auto_actioned=should_auto_action,
+                prior_decision=prior_decision,
             )
 
         # Log the decision

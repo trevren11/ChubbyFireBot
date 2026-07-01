@@ -16,12 +16,45 @@ from discord.ui import Button, View
 from src.reddit_client import RedditItem, RemovalReason
 
 
+def _author_history_field(author: str, decision_logger=None) -> Optional[dict]:
+    """Build a mod history embed field for an author, or None if first time."""
+    if not decision_logger:
+        return None
+    past = decision_logger.get_by_author(author)
+    if not past:
+        return None
+    posts = sum(1 for d in past if d.content_type == "post")
+    comments = sum(1 for d in past if d.content_type == "comment")
+    approved = sum(1 for d in past if d.action == "approve")
+    removed = sum(1 for d in past if d.action == "remove")
+    flagged = sum(1 for d in past if d.action == "flag")
+    parts = []
+    if posts:
+        parts.append(f"{posts} post{'s' if posts != 1 else ''}")
+    if comments:
+        parts.append(f"{comments} comment{'s' if comments != 1 else ''}")
+    summary = " · ".join(parts) + " seen"
+    actions = []
+    if approved:
+        actions.append(f"{approved} approved")
+    if removed:
+        actions.append(f"{removed} removed")
+    if flagged:
+        actions.append(f"{flagged} flagged")
+    if actions:
+        summary += " — " + ", ".join(actions)
+    return {"name": "Mod History", "value": summary, "inline": False}
+
+
 def send_bot_message(
     item: RedditItem,
     bot_decision: str,
     confidence: float,
     reason: str,
     dry_run: bool = False,
+    decision_logger=None,
+    auto_actioned: bool = False,
+    prior_decision=None,
 ) -> bool:
     """Send notification via Discord bot REST API (for cron jobs)."""
     bot_token = os.getenv("DISCORD_BOT_TOKEN")
@@ -32,25 +65,54 @@ def send_bot_message(
         return False
 
     # Build embed
-    prefix = "[DRY RUN] " if dry_run else ""
-    title = item.title[:50] + "..." if item.title and len(item.title) > 50 else (item.title or "Comment")
+    dry_prefix = "[DRY RUN] " if dry_run else ""
+    if auto_actioned and bot_decision == "remove":
+        action_prefix = "[AUTO-REMOVED] "
+    elif auto_actioned and bot_decision == "approve":
+        action_prefix = "[AUTO-APPROVED] "
+    else:
+        action_prefix = f"[{item.content_type.upper()}] "
+    title = item.title[:200] if item.title else "Comment"
 
     colors = {"approve": 0x00FF00, "remove": 0xFF0000, "flag": 0xFFFF00}
     color = colors.get(bot_decision, 0x0000FF)
 
+    description = f"**Author:** u/{item.author} ({item.author_karma:,} karma, {item.account_age_days}d old)"
+    if not auto_actioned:
+        description += f"\n\n>>> {item.body[:3800] if item.body else '_No content_'}"
+
+    fields = [
+        {"name": "Decision", "value": f"**{bot_decision.upper()}** ({confidence:.0%})", "inline": True},
+        {"name": "Reason", "value": reason[:256], "inline": True},
+    ]
+    if prior_decision:
+        fields.append({
+            "name": "⚠️ Previously Actioned",
+            "value": f"**{prior_decision.action.upper()}**ed ({prior_decision.confidence:.0%}) — {prior_decision.reason[:150]}",
+            "inline": False,
+        })
+    history_field = _author_history_field(item.author, decision_logger)
+    if history_field:
+        fields.append(history_field)
+
     embed = {
-        "title": f"{prefix}[{item.content_type.upper()}] {title}",
-        "description": f"**Author:** u/{item.author} ({item.author_karma:,} karma, {item.account_age_days}d old)\n\n>>> {item.body[:500] if item.body else '_No content_'}",
+        "title": f"{dry_prefix}{action_prefix}{title}",
+        "description": description,
         "color": color,
         "url": item.url,
-        "fields": [
-            {"name": "Decision", "value": f"**{bot_decision.upper()}** ({confidence:.0%})", "inline": True},
-            {"name": "Reason", "value": reason[:256], "inline": True},
-        ],
+        "fields": fields,
         "footer": {"text": f"ID: {item.reddit_id}"},
     }
 
-    payload = json.dumps({"embeds": [embed]}).encode("utf-8")
+    # Only include buttons if human review is needed
+    payload_data: dict = {"embeds": [embed]}
+    if not auto_actioned:
+        payload_data["components"] = [{"type": 1, "components": [
+            {"type": 2, "style": 3, "label": "✅ Approve", "custom_id": f"approve_{item.reddit_id}"},
+            {"type": 2, "style": 4, "label": "❌ Remove", "custom_id": f"remove_{item.reddit_id}"},
+        ]}]
+
+    payload = json.dumps(payload_data).encode("utf-8")
 
     try:
         req = urllib.request.Request(
@@ -59,6 +121,7 @@ def send_bot_message(
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bot {bot_token}",
+                "User-Agent": "DiscordBot (https://github.com/Rapptz/discord.py, 2.3.2)",
             },
             method="POST",
         )
@@ -79,13 +142,23 @@ class ModerationEmbed:
         confidence: float,
         reason: str,
         dry_run: bool = False,
+        decision_logger=None,
+        auto_actioned: bool = False,
+        prior_decision=None,
     ) -> Embed:
         """Create an embed for a moderation decision."""
-        # Title based on content type
-        if item.content_type == "post":
-            title = f"[POST] {item.title[:50]}..." if len(item.title or "") > 50 else f"[POST] {item.title}"
+        # Title based on content type and whether bot already acted
+        if auto_actioned and bot_decision == "remove":
+            prefix = "[AUTO-REMOVED]"
+        elif auto_actioned and bot_decision == "approve":
+            prefix = "[AUTO-APPROVED]"
+        elif item.content_type == "post":
+            prefix = "[POST]"
         else:
-            title = "[COMMENT] Review Needed"
+            prefix = "[COMMENT]"
+
+        base_title = item.title[:200] if item.title else "Review Needed"
+        title = f"{prefix} {base_title}"
 
         if dry_run:
             title = f"[DRY RUN] {title}"
@@ -113,19 +186,17 @@ class ModerationEmbed:
                     report_strs.append(f"{r['reason']} [mod]")
             description_parts.append(f"**Reports:** {', '.join(report_strs)}")
 
-        description_parts.append("")
-
-        # Add content preview (truncated)
-        content = item.body or ""
-        if len(content) > 500:
-            content = content[:500] + "..."
-        description_parts.append(f">>> {content}" if content else "_No text content_")
+        # For auto-actioned items, skip the body — just show author line
+        if not auto_actioned:
+            description_parts.append("")
+            content = item.body or ""
+            description_parts.append(f">>> {content}" if content else "_No text content_")
 
         description = "\n".join(description_parts)
 
-        # Truncate description if too long
-        if len(description) > 1024:
-            description = description[:1021] + "..."
+        # Discord embed description hard limit is 4096 chars
+        if len(description) > 4096:
+            description = description[:4093] + "..."
 
         embed = Embed(
             title=title,
@@ -140,6 +211,17 @@ class ModerationEmbed:
         decision_text = f"**{bot_decision.upper()}** ({confidence_pct} confidence)"
         embed.add_field(name="Bot Decision", value=decision_text, inline=True)
         embed.add_field(name="Reason", value=reason[:256], inline=True)
+
+        if prior_decision:
+            embed.add_field(
+                name="⚠️ Previously Actioned",
+                value=f"**{prior_decision.action.upper()}**ed ({prior_decision.confidence:.0%}) — {prior_decision.reason[:150]}",
+                inline=False,
+            )
+
+        history_field = _author_history_field(item.author, decision_logger)
+        if history_field:
+            embed.add_field(name=history_field["name"], value=history_field["value"], inline=False)
 
         embed.set_footer(text=f"ID: {item.reddit_id}")
 
@@ -338,6 +420,9 @@ class DiscordBot:
         reason: str,
         removal_reasons: list[RemovalReason],
         dry_run: bool = False,
+        decision_logger=None,
+        auto_actioned: bool = False,
+        prior_decision=None,
     ) -> str:
         """Send a moderation message to Discord and return the message ID."""
         channel = self._bot.get_channel(self.channel_id)
@@ -350,16 +435,20 @@ class DiscordBot:
             confidence=confidence,
             reason=reason,
             dry_run=dry_run,
+            decision_logger=decision_logger,
+            auto_actioned=auto_actioned,
+            prior_decision=prior_decision,
         )
 
-        # Create view with action buttons
-        view = ModerationView(
-            removal_reasons=removal_reasons,
-            on_approve=self.handle_approve,
-            on_remove=self.handle_remove,
-        )
-
-        message = await channel.send(embed=embed, view=view)
+        if auto_actioned:
+            message = await channel.send(embed=embed)
+        else:
+            view = ModerationView(
+                removal_reasons=removal_reasons,
+                on_approve=self.handle_approve,
+                on_remove=self.handle_remove,
+            )
+            message = await channel.send(embed=embed, view=view)
 
         # Track the mapping
         self.tracker.save(str(message.id), item.reddit_id)

@@ -20,7 +20,7 @@ from monitors.new_posts import NewPostsMonitor
 
 def get_config() -> dict:
     """Load configuration from environment variables."""
-    load_dotenv()
+    load_dotenv(override=True)
 
     required = [
         "REDDIT_CLIENT_ID",
@@ -174,12 +174,68 @@ def generate_weekly_summary(config: dict) -> None:
     print(f"  Actions: {counts}")
 
 
+async def run_bot_gateway(config: dict) -> None:
+    """Run the Discord gateway bot for handling button interactions."""
+    import discord
+    from discord.ext import commands
+
+    reddit = RedditClient(**config["reddit"])
+    dry_run = config.get("dry_run", False)
+    pid_file = config["data_dir"] / "bot.pid"
+
+    intents = discord.Intents.default()
+    bot = commands.Bot(command_prefix="!", intents=intents)
+
+    @bot.event
+    async def on_ready():
+        pid_file.write_text(str(os.getpid()))
+        print(f"[{datetime.now()}] ChubbyMod gateway ready: {bot.user} (PID {os.getpid()})", flush=True)
+
+    @bot.event
+    async def on_interaction(interaction: discord.Interaction):
+        if interaction.type != discord.InteractionType.component:
+            return
+        custom_id = interaction.data.get("custom_id", "")
+
+        if custom_id.startswith("approve_"):
+            reddit_id = custom_id[len("approve_"):]
+            # Defer immediately so Discord doesn't time out while Reddit API call runs
+            await interaction.response.defer()
+            if not dry_run:
+                await asyncio.get_event_loop().run_in_executor(None, reddit.approve, reddit_id)
+            embed = interaction.message.embeds[0]
+            embed.colour = discord.Color.green()
+            embed.title = f"[APPROVED] {embed.title}"
+            if embed.description:
+                embed.description = embed.description.split("\n")[0]
+            await interaction.message.edit(embed=embed, view=None)
+            print(f"[{datetime.now()}] Human approved: {reddit_id}", flush=True)
+
+        elif custom_id.startswith("remove_"):
+            reddit_id = custom_id[len("remove_"):]
+            await interaction.response.defer()
+            if not dry_run:
+                await asyncio.get_event_loop().run_in_executor(None, reddit.remove, reddit_id)
+            embed = interaction.message.embeds[0]
+            embed.colour = discord.Color.red()
+            embed.title = f"[REMOVED] {embed.title}"
+            if embed.description:
+                embed.description = embed.description.split("\n")[0]
+            await interaction.message.edit(embed=embed, view=None)
+            print(f"[{datetime.now()}] Human removed: {reddit_id}", flush=True)
+
+    try:
+        await bot.start(config["discord"]["token"])
+    finally:
+        pid_file.unlink(missing_ok=True)
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description="ChubbyFireBot - Reddit moderation bot")
     parser.add_argument(
         "command",
-        choices=["mod-queue", "new-posts", "weekly-summary", "all"],
+        choices=["mod-queue", "new-posts", "weekly-summary", "all", "bot"],
         help="Command to run",
     )
     parser.add_argument(
@@ -213,6 +269,8 @@ def main():
     elif args.command == "all":
         asyncio.run(run_mod_queue(config, dry_run))
         asyncio.run(run_new_posts(config, dry_run))
+    elif args.command == "bot":
+        asyncio.run(run_bot_gateway(config))
 
 
 if __name__ == "__main__":
